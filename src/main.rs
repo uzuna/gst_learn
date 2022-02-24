@@ -1,4 +1,6 @@
 extern crate gstreamer as gst;
+use std::io::Write;
+
 use anyhow::Context;
 use env_logger::Env;
 use gst::prelude::*;
@@ -197,6 +199,154 @@ fn tutorial_dynamic_pipeline() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn tutorial_queue() -> anyhow::Result<()> {
+    struct CustomData {
+        /// Our one and only element
+        playbin: gst::Element,
+        playing: bool,
+        terminate: bool,
+        seek_enabled: bool,
+        seek_done: bool,
+        duration: Option<gst::ClockTime>,
+    }
+
+    impl CustomData {
+        fn new(playbin: gst::Element) -> Self {
+            Self {
+                playbin,
+                playing: false,
+                terminate: false,
+                seek_enabled: false,
+                seek_done: false,
+                duration: gst::ClockTime::NONE,
+            }
+        }
+    }
+
+    fn handle_message(custom_data: &mut CustomData, msg: &gst::Message) -> anyhow::Result<()> {
+        use gst::MessageView::*;
+
+        match msg.view() {
+            Error(err) => {
+                log::error!(
+                    "Error receive from Element {:?} {} {:?}",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug(),
+                );
+                custom_data.terminate = true;
+            }
+            Eos(_) => {
+                log::info!("end of stream");
+                custom_data.terminate = true;
+            }
+            DurationChanged(_) => {
+                custom_data.duration = gst::ClockTime::NONE;
+            }
+            StateChanged(state_changed) => {
+                if state_changed
+                    .src()
+                    .map(|s| s == custom_data.playbin)
+                    .unwrap_or(false)
+                {
+                    let new_state = state_changed.current();
+                    let old_state = state_changed.old();
+
+                    log::info!(
+                        "Pipeline state changed from {:?} to {:?}",
+                        old_state,
+                        new_state
+                    );
+
+                    custom_data.playing = new_state == gst::State::Playing;
+                    if custom_data.playing {
+                        // 再生が再開した時にSeekの状況がどうだったのかを確認する
+                        // queryを使うことでパイプラインに情報を照会できる
+                        let mut seeking = gst::query::Seeking::new(gst::Format::Time);
+                        if custom_data.playbin.query(&mut seeking) {
+                            let (seekable, start, end) = seeking.result();
+                            custom_data.seek_enabled = seekable;
+                            if seekable {
+                                log::info!("Seeking is Enabled from {} to {}", start, end);
+                            } else {
+                                log::info!("Seeking is Distable for this stream");
+                            }
+                        } else {
+                            log::error!("Seeking query failed")
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    gst::init().context("failed to init")?;
+    let playbin = gst::ElementFactory::make("playbin", Some("playbin")).context("make playbin")?;
+    let uri =
+        "https://www.freedesktop.org/software/gstreamer-sdk/data/media/sintel_trailer-480p.webm";
+    playbin.set_property("uri", uri);
+    playbin
+        .set_state(gst::State::Playing)
+        .context("set state playing")?;
+
+    let bus = playbin.bus().context("bus")?;
+
+    let mut custom_data = CustomData::new(playbin);
+
+    while !custom_data.terminate {
+        // メッセージの取得の制限時間を0.1秒とする
+        let msg = bus.timed_pop(100 * gst::ClockTime::MSECOND);
+
+        match msg {
+            Some(msg) => {
+                handle_message(&mut custom_data, &msg)?;
+            }
+            None => {
+                // イベントが特にないなら通常通り更新する
+                if custom_data.playing {
+                    // query_positionで一夜基幹についt一般的な情報が得られる
+                    let position = custom_data
+                        .playbin
+                        .query_position::<gst::ClockTime>()
+                        .context("Could not query current position.")?;
+
+                    if custom_data.duration == gst::ClockTime::NONE {
+                        custom_data.duration = custom_data.playbin.query_duration();
+                    }
+
+                    log::info!("Position {} / {}", position, custom_data.duration.display());
+
+                    std::io::stdout().flush().context("flush stdout")?;
+
+                    // 再生状況を見て1度だけSeekイベントを発生させる
+                    if custom_data.seek_enabled
+                        && !custom_data.seek_done
+                        && position > 3 * gst::ClockTime::SECOND
+                    {
+                        log::info!("Reached 10s, performing seek...");
+                        // playbinに対して再生位置の指示を飛ばす
+                        // GST_SEEK_FLAG_FLUSH: シークを実行する前に現在パイプラインにある全てのデータが破棄される。パイプラインにデータが流れるまで表示が一時停止するが、アプリケーションの応答性が良くなる。というか指定しないとPLAYINGなので破棄できなくて落ちる。
+                        // GST_SEEK_FLAG_KEY_UNIT: ほとんどのビデオストリームは任意の位置を探せない。代わりにキーフレームには移動できる。これは最も近いキーフレームに移動する指示で基本的に他に選択肢はない。
+                        // GST_SEEK_FLAG_ACCURATE: 一部メディアクリップは十分なインデックスがない事がありシーク位置を探すのに時間がかかる。Gstreamerは通常これを避けるために推定をするが位置精度が十分でない場合に正確な位置に飛ばしたい場合にこのフラグを立てる
+                        custom_data
+                            .playbin
+                            .seek_simple(
+                                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                                20 * gst::ClockTime::SECOND,
+                            )
+                            .context("seek")?;
+                        custom_data.seek_done = true;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// show content of tutorial. B?=Basic
@@ -212,6 +362,7 @@ arg_enum! {
         // Basic tutorial 2 Gstreamer concept
         B2,
         B3,
+        B4,
     }
 }
 
@@ -224,5 +375,6 @@ fn main() {
         Tutorial::B1 => tutorial_helloworld().unwrap(),
         Tutorial::B2 => tutorial_concept().unwrap(),
         Tutorial::B3 => tutorial_dynamic_pipeline().unwrap(),
+        Tutorial::B4 => tutorial_queue().unwrap(),
     }
 }
