@@ -738,6 +738,163 @@ fn tutorial_guikit() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 通常は自動的に処理されるPadについて
+/// 取得の方法とタイミング
+/// なぜPadについて知らなければならないか
+fn tutorial_media_pad() -> anyhow::Result<()> {
+    // 設定可能なCapabilityの一覧
+    fn print_caps(caps: &gst::Caps, prefix: &str) {
+        if caps.is_any() {
+            log::info!("{prefix}ANY");
+            return;
+        }
+
+        if caps.is_empty() {
+            log::info!("{prefix}EMPTY");
+            return;
+        }
+
+        for structure in caps.iter() {
+            log::info!("{prefix}{}", structure.name());
+            for (field, value) in structure.iter() {
+                log::info!("{prefix} {field}:{}", value.serialize().unwrap().as_str());
+            }
+        }
+    }
+    // Elementの詳細を表示
+    fn print_pad_template_information(factory: &gst::ElementFactory) {
+        let long_name = factory
+            .metadata("long-name")
+            .expect("Failed to get long-name of element factory.");
+        log::info!("Pad Template for {long_name}:");
+        if factory.num_pad_templates() == 0u32 {
+            log::info!("  None");
+            return;
+        }
+
+        // padの情報を取り出す
+        for pad_template in factory.static_pad_templates() {
+            if pad_template.direction() == gst::PadDirection::Src {
+                log::info!("  SRC template: '{}'", pad_template.name_template());
+            } else if pad_template.direction() == gst::PadDirection::Sink {
+                log::info!("  SINK template: '{}'", pad_template.name_template());
+            } else {
+                log::info!("  UNKNOWN!!! template: '{}'", pad_template.name_template());
+            }
+            if pad_template.presence() == gst::PadPresence::Always {
+                log::info!("  Availability: Always");
+            } else if pad_template.presence() == gst::PadPresence::Sometimes {
+                log::info!("  Availability: Sometimes");
+            } else if pad_template.presence() == gst::PadPresence::Request {
+                log::info!("  Availability: On request");
+            } else {
+                log::info!("  Availability: UNKNOWN!!!");
+            }
+
+            let caps = pad_template.caps();
+            log::info!("  Capabilities:");
+            print_caps(&caps, "    ");
+        }
+    }
+
+    fn print_pad_capabilities(element: &gst::Element, pad_name: &str) {
+        let pad = element
+            .static_pad(pad_name)
+            .expect("Could not retrieve pad");
+
+        log::info!("Caps for the {} pad:", pad_name);
+        let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
+        print_caps(&caps, "      ");
+    }
+
+    // Initialize GStreamer
+    gst::init().unwrap();
+
+    // Create the element factories
+    let source_factory = gst::ElementFactory::find("audiotestsrc")
+        .context("Failed to create audiotestsrc factory.")?;
+    let sink_factory = gst::ElementFactory::find("autoaudiosink")
+        .context("Failed to create autoaudiosink factory.")?;
+
+    // Print information about the pad templates of these factories
+    print_pad_template_information(&source_factory);
+    print_pad_template_information(&sink_factory);
+
+    // Ask the factories to instantiate actual elements
+    let source = source_factory
+        .create(Some("source"))
+        .context("Failed to create source element")?;
+    let sink = sink_factory
+        .create(Some("sink"))
+        .context("Failed to create sink element")?;
+
+    // Create the empty pipeline
+    let pipeline = gst::Pipeline::new(Some("test-pipeline"));
+
+    pipeline.add_many(&[&source, &sink]).unwrap();
+    source
+        .link(&sink)
+        .context("Elements could not be linked.")?;
+
+    // Print initial negotiated caps (in NULL state)
+    log::info!("In NULL state:");
+    print_pad_capabilities(&sink, "sink");
+
+    // Start playing
+    let res = pipeline.set_state(gst::State::Playing);
+    if res.is_err() {
+        log::error!(
+            "Unable to set the pipeline to the `Playing` state (check the bus for error messages)."
+        )
+    }
+
+    // Wait until error, EOS or State Change
+    let bus = pipeline.bus().unwrap();
+
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        use gst::MessageView;
+
+        match msg.view() {
+            MessageView::Error(err) => {
+                log::error!(
+                    "Error received from element {:?}: {} ({:?})",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug()
+                );
+                break;
+            }
+            MessageView::Eos(..) => {
+                log::info!("End-Of-Stream reached.");
+                break;
+            }
+            MessageView::StateChanged(state_changed) =>
+            // We are only interested in state-changed messages from the pipeline
+            {
+                if state_changed.src().map(|s| s == pipeline).unwrap_or(false) {
+                    let new_state = state_changed.current();
+                    let old_state = state_changed.old();
+
+                    log::info!(
+                        "Pipeline state changed from {:?} to {:?}",
+                        old_state,
+                        new_state
+                    );
+                    print_pad_capabilities(&sink, "sink");
+                }
+            }
+            _ => (),
+        }
+    }
+
+    // Shutdown pipeline
+    pipeline
+        .set_state(gst::State::Null)
+        .context("Unable to set the pipeline to the `Null` state")?;
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// show content of tutorial. B?=Basic
@@ -755,6 +912,7 @@ arg_enum! {
         B3,
         B4,
         B5,
+        B6,
     }
 }
 
@@ -769,5 +927,6 @@ fn main() {
         Tutorial::B3 => tutorial_dynamic_pipeline().unwrap(),
         Tutorial::B4 => tutorial_queue().unwrap(),
         Tutorial::B5 => tutorial_guikit().unwrap(),
+        Tutorial::B6 => tutorial_media_pad().unwrap(),
     }
 }
