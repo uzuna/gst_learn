@@ -808,7 +808,7 @@ fn tutorial_media_pad() -> anyhow::Result<()> {
     }
 
     // Initialize GStreamer
-    gst::init().unwrap();
+    gst::init().context("failed to init")?;
 
     // Create the element factories
     let source_factory = gst::ElementFactory::find("audiotestsrc")
@@ -895,6 +895,101 @@ fn tutorial_media_pad() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// パイプラインの一部の実行の新しいスレッドを作成する方法
+/// パッドの可用性とは
+/// ストリームの複製する方法
+fn tutorial_multithread_pad() -> anyhow::Result<()> {
+    // Gstreamはマルチスレッドフレームワーク。ストリーミングをアプリケーションスレッドから切り離すために内部でスレッドの作成と破棄をする。
+    // プラグインは独自の処理用のスレッドを作ることも出来る
+    // パイプライン小売クジもブランチが別のスレッドで実行されるように明示的に指定できる
+    // ここではteeを通してvideoとaudioを別スレッドで処理する
+
+    // Initialize GStreamer
+    gst::init()?;
+
+    let audio_source = gst::ElementFactory::make("audiotestsrc", Some("audio_source"))?;
+    let tee = gst::ElementFactory::make("tee", Some("tee"))?;
+    // queueが別スレッドで実行する受け役
+    let audio_queue = gst::ElementFactory::make("queue", Some("audio_queue"))?;
+    let audio_convert = gst::ElementFactory::make("audioconvert", Some("audio_convert"))?;
+    let audio_resample = gst::ElementFactory::make("audioresample", Some("audio_resample"))?;
+    let audio_sink = gst::ElementFactory::make("autoaudiosink", Some("audio_sink"))?;
+
+    // 音声シグナルを波形表示に変換する
+    let visual = gst::ElementFactory::make("wavescope", Some("visual"))?;
+    let video_queue = gst::ElementFactory::make("queue", Some("video_queue"))?;
+    let video_convert = gst::ElementFactory::make("videoconvert", Some("video_convert"))?;
+    let video_sink = gst::ElementFactory::make("autovideosink", Some("video_sink"))?;
+
+    let pipeline = gst::Pipeline::new(Some("pipeline"));
+
+    // 生成波形の指定とbisualizerのパラメータ指定
+    audio_source.set_property("freq", 440.0_f64);
+    visual.set_property_from_str("shader", "none");
+    visual.set_property_from_str("style", "lines");
+
+    pipeline.add_many(&[
+        &audio_source,
+        &tee,
+        &audio_queue,
+        &audio_convert,
+        &audio_resample,
+        &audio_sink,
+        &visual,
+        &video_queue,
+        &video_convert,
+        &video_sink,
+    ])?;
+
+    // パイプラインをそれぞれ3スレッドでリンク
+    gst::Element::link_many(&[&audio_source, &tee])?;
+    gst::Element::link_many(&[&audio_queue, &audio_convert, &audio_resample, &audio_sink])?;
+    gst::Element::link_many(&[&video_queue, &visual, &video_convert, &video_sink])?;
+
+    // リクエストパッドを要求してQueueにリンクする
+    let tee_audio_pad = tee.request_pad_simple("src_%u").context("tee_audio_pad")?;
+    log::info!(
+        "Obtained request pad {} for audio branch",
+        tee_audio_pad.name()
+    );
+    let queue_audio_pad = audio_queue.static_pad("sink").context("queue_audio_pad")?;
+    tee_audio_pad.link(&queue_audio_pad)?;
+
+    let tee_video_pad = tee.request_pad_simple("src_%u").context("tee_video_pad")?;
+    log::info!(
+        "Obtained request pad {} for video branch",
+        tee_audio_pad.name()
+    );
+    let queue_video_pad = video_queue.static_pad("sink").context("queue_video_pad")?;
+    tee_video_pad.link(&queue_video_pad)?;
+
+    pipeline.set_state(gst::State::Playing)?;
+    let bus = pipeline.bus().context("bus")?;
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        use gst::MessageView::*;
+        match msg.view() {
+            Error(err) => {
+                log::error!(
+                    "Error received from element {:?}: {} {:?}",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug()
+                );
+                break;
+            }
+
+            Eos(..) => break,
+            _ => (),
+        }
+    }
+
+    pipeline
+        .set_state(gst::State::Null)
+        .expect("Unable to set the pipeline to the `Null` state");
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// show content of tutorial. B?=Basic
@@ -913,6 +1008,7 @@ arg_enum! {
         B4,
         B5,
         B6,
+        B7,
     }
 }
 
@@ -928,5 +1024,6 @@ fn main() {
         Tutorial::B4 => tutorial_queue().unwrap(),
         Tutorial::B5 => tutorial_guikit().unwrap(),
         Tutorial::B6 => tutorial_media_pad().unwrap(),
+        Tutorial::B7 => tutorial_multithread_pad().unwrap(),
     }
 }
