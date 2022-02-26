@@ -19,6 +19,7 @@ gstreamer-video = { version = "0.18.5", optional = true }
 gtk = {version="0.15.4", optional = true}
 log = "0.4.14"
 structopt = "0.3.26"
+termion = "1.5.6"
 
 [features]
 default = ["tutorial5-x11"]

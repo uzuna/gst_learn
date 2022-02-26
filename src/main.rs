@@ -1510,6 +1510,206 @@ fn tutorial_streaming() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 再生速度を変化させる方法
+/// ビデオをフレームごとに進める方法
+fn tutorial_playback_speed() -> anyhow::Result<()> {
+    // 再生速度の変化、逆再生についても再生レートで制御できる
+    // 再生速度の変更方法はステップイベントとシークイベントの2種類がある
+    // ステップイベントは主に1以上の高速再生でメディアをスキップするのに
+    // シークイベントは逆再生も含めて任意の位置にジャンプするのに使う
+    // ステップイベントは少ない設定で出来る変わりに行くるか制約があるため例ではシークイベントを使う
+
+    use gst::event::{Seek, Step};
+    use gst::prelude::*;
+    use gst::{Element, SeekFlags, SeekType, State};
+
+    use anyhow::Error;
+
+    use termion::event::Key;
+    use termion::input::TermRead;
+    use termion::raw::IntoRawMode;
+
+    use std::{io, thread, time};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Command {
+        PlayPause,
+        DataRateUp,
+        DataRateDown,
+        ReverseRate,
+        NextFrame,
+        Quit,
+    }
+
+    fn send_seek_event(pipeline: &Element, rate: f64) -> bool {
+        let position = match pipeline.query_position() {
+            Some(pos) => pos,
+            None => {
+                eprintln!("Unable to retrieve current position...\r");
+                return false;
+            }
+        };
+
+        // seekはワーニングが出ていて出来なかった
+        // matroska-demux.c:2953:gst_matroska_demux_handle_seek_push:<matroskademux0> Seek end-time not supported in streaming mode
+        let seek_event = if rate > 0. {
+            Seek::new(
+                rate,
+                SeekFlags::FLUSH | SeekFlags::ACCURATE,
+                SeekType::Set,
+                position,
+                SeekType::End,
+                gst::ClockTime::ZERO,
+            )
+        } else {
+            Seek::new(
+                rate,
+                SeekFlags::FLUSH | SeekFlags::ACCURATE,
+                SeekType::Set,
+                position,
+                SeekType::Set,
+                position,
+            )
+        };
+
+        // If we have not done so, obtain the sink through which we will send the seek events
+        if let Ok(Some(video_sink)) = pipeline.try_property::<Option<Element>>("video-sink") {
+            println!("Current rate: {}\r", rate);
+            // Send the event
+            let r = video_sink.send_event(seek_event);
+            if !r {
+                log::warn!("failed to set seek event");
+            }
+
+            r
+        } else {
+            eprintln!("Failed to update rate...\r");
+            false
+        }
+    }
+
+    fn handle_keyboard(ready_tx: glib::Sender<Command>) {
+        // We set the terminal in "raw mode" so that we can get the keys without waiting for the user
+        // to press return.
+        let _stdout = io::stdout().into_raw_mode().unwrap();
+        let mut stdin = termion::async_stdin().keys();
+
+        loop {
+            if let Some(Ok(input)) = stdin.next() {
+                let command = match input {
+                    Key::Char('p' | 'P') => Command::PlayPause,
+                    Key::Char('s') => Command::DataRateDown,
+                    Key::Char('S') => Command::DataRateUp,
+                    Key::Char('d' | 'D') => Command::ReverseRate,
+                    Key::Char('n' | 'N') => Command::NextFrame,
+                    Key::Char('q' | 'Q') => Command::Quit,
+                    Key::Ctrl('c' | 'C') => Command::Quit,
+                    _ => continue,
+                };
+                ready_tx
+                    .send(command)
+                    .expect("failed to send data through channel");
+                if command == Command::Quit {
+                    break;
+                }
+            }
+            thread::sleep(time::Duration::from_millis(50));
+        }
+    }
+
+    gst::init()?;
+
+    // Print usage map.
+    println!(
+        "\
+USAGE: Choose one of the following options, then press enter:
+ 'P' to toggle between PAUSE and PLAY
+ 'S' to increase playback speed, 's' to decrease playback speed
+ 'D' to toggle playback direction
+ 'N' to move to next frame (in the current direction, better in PAUSE)
+ 'Q' to quit"
+    );
+
+    // Get a main context...
+    let main_context = glib::MainContext::default();
+    // ... and make it the main context by default so that we can then have a channel to send the
+    // commands we received from the terminal.
+    let _guard = main_context.acquire().unwrap();
+
+    // Build the channel to get the terminal inputs from a different thread.
+    let (ready_tx, ready_rx) = glib::MainContext::channel(glib::PRIORITY_DEFAULT);
+    thread::spawn(move || handle_keyboard(ready_tx));
+
+    // Build the pipeline.
+    let uri =
+        "https://www.freedesktop.org/software/gstreamer-sdk/data/media/sintel_trailer-480p.webm";
+    let pipeline = gst::parse_launch(&format!("playbin uri={}", uri))?;
+
+    // Start playing.
+    let _ = pipeline.set_state(State::Playing)?;
+    let main_loop = glib::MainLoop::new(Some(&main_context), false);
+    let main_loop_clone = main_loop.clone();
+    let pipeline_weak = pipeline.downgrade();
+    let mut playing = true;
+    let mut rate = 1.;
+
+    ready_rx.attach(Some(&main_loop.context()), move |command: Command| {
+        use Command::*;
+        let pipeline = match pipeline_weak.upgrade() {
+            Some(pipeline) => pipeline,
+            None => return glib::Continue(true),
+        };
+
+        match command {
+            PlayPause => {
+                let status = if playing {
+                    let _ = pipeline.set_state(State::Paused);
+                    "PAUSE"
+                } else {
+                    let _ = pipeline.set_state(State::Playing);
+                    "PLAYING"
+                };
+                playing = !playing;
+                println!("Setting state to {}\r", status);
+            }
+            DataRateUp => {
+                if send_seek_event(&pipeline, rate * 2.) {
+                    rate *= 2.;
+                }
+            }
+            DataRateDown => {
+                if send_seek_event(&pipeline, rate / 2.) {
+                    rate /= 2.;
+                }
+            }
+            ReverseRate => {
+                if send_seek_event(&pipeline, rate * -1.) {
+                    rate *= -1.;
+                }
+            }
+            NextFrame => {
+                if let Ok(Some(video_sink)) = pipeline.try_property::<Option<Element>>("video-sink")
+                {
+                    // Send the event
+                    let step = Step::new(gst::format::Buffers(1), rate.abs(), true, false);
+                    video_sink.send_event(step);
+                    println!("Stepping one frame\r");
+                }
+            }
+            Quit => {
+                main_loop_clone.quit();
+            }
+        }
+
+        glib::Continue(true)
+    });
+    main_loop.run();
+
+    pipeline.set_state(State::Null)?;
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(subcommand)]
@@ -1543,6 +1743,8 @@ enum Tutorial {
     },
     // Basic tutorial 12 Buffering
     B12,
+    // Basic tutorial 13 PlaybackSpeed
+    B13,
 }
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
@@ -1560,5 +1762,6 @@ fn main() {
         Tutorial::B8 => tutorial_shortcut_pipeline().unwrap(),
         Tutorial::B9 { uri } => tutorial_media_info(&uri).unwrap(),
         Tutorial::B12 => tutorial_streaming().unwrap(),
+        Tutorial::B13 => tutorial_playback_speed().unwrap(),
     }
 }
