@@ -990,6 +990,293 @@ fn tutorial_multithread_pad() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 通常GStreamerは完全に閉じている必要はない
+/// パイプラインに外からデータを注入する方法
+/// パイプラインからデータを取り出す方法
+/// データにアクセス、操作をする方法
+fn tutorial_shortcut_pipeline() -> anyhow::Result<()> {
+    // 幾つかの方法でパイプラインを流れるデータと対話出来る
+    // アプリケーションデータをGStreamerに挿入するために使用する要素はappsrc
+    // 出力のための要素はappsink
+    // appsrcはPull or Pushモード、パイプライン下段主導か、独自のタイミングで出力するか選べる
+    // このサンプルではPushモードとなる
+
+    // データはバッファと呼ばれるチャンクでパイプラインを通過する。 `GstBuffers`
+    // Srcで生成されてSinkで消費される
+    // データの単位でしかないため、サイズ、タイムスタンプ、エレメントでのin/out個数は一定ではない
+    // 今回の例ではANYキャップを使用してタイムスタンプを含まないバッファーを生成する
+    // 逆にvideoとかはフレームを何時表示するのかを示す非常に正確なタイムスタンプがある
+
+    use std::sync::{Arc, Mutex};
+
+    use byte_slice_cast::*;
+
+    use glib::source::SourceId;
+    use gstreamer_app::{AppSink, AppSrc};
+    use gstreamer_audio::AudioInfo;
+
+    const CHUNK_SIZE: usize = 1024; // Amount of bytes we are sending in each buffer
+    const SAMPLE_RATE: u32 = 44_100; // Samples per second we are sending
+
+    #[derive(Debug)]
+    struct CustomData {
+        source_id: Option<SourceId>,
+
+        // Number of samples generated so far(for tunestamp generation)
+        num_samples: u64,
+        // For waveforn generatuin
+        a: f64,
+        b: f64,
+        c: f64,
+        d: f64,
+
+        appsrc: AppSrc,
+        appsink: AppSink,
+    }
+
+    impl CustomData {
+        fn new(appsrc: &AppSrc, appsink: &AppSink) -> Self {
+            Self {
+                source_id: None,
+                num_samples: 0,
+                a: 0.0,
+                b: 1.0,
+                c: 0.0,
+                d: 1.0,
+                appsrc: appsrc.clone(),
+                appsink: appsink.clone(),
+            }
+        }
+    }
+    // Initialize GStreamer
+    gst::init()?;
+
+    let appsrc = gst::ElementFactory::make("appsrc", Some("audio_source"))?;
+    let tee = gst::ElementFactory::make("tee", Some("tee"))?;
+    // queueが別スレッドで実行する受け役
+    let audio_queue = gst::ElementFactory::make("queue", Some("audio_queue"))?;
+    let audio_convert1 = gst::ElementFactory::make("audioconvert", Some("audio_convert1"))?;
+    let audio_resample = gst::ElementFactory::make("audioresample", Some("audio_resample"))?;
+    let audio_sink = gst::ElementFactory::make("autoaudiosink", Some("audio_sink"))?;
+
+    // 音声シグナルを波形表示に変換する
+    let video_queue = gst::ElementFactory::make("queue", Some("video_queue"))?;
+    let audio_convert2 = gst::ElementFactory::make("audioconvert", Some("audio_convert2"))?;
+    let visual = gst::ElementFactory::make("wavescope", Some("visual"))?;
+    let video_convert = gst::ElementFactory::make("videoconvert", Some("video_convert"))?;
+    let video_sink = gst::ElementFactory::make("autovideosink", Some("video_sink"))?;
+
+    // appsinkに流す
+    let app_queue = gst::ElementFactory::make("queue", Some("app_queue"))?;
+    let appsink = gst::ElementFactory::make("appsink", Some("app_sink"))?;
+
+    let pipeline = gst::Pipeline::new(Some("pipeline"));
+    visual.set_property_from_str("shader", "none");
+    visual.set_property_from_str("style", "lines");
+
+    // add pipeline
+    pipeline.add_many(&[
+        &appsrc,
+        &tee,
+        &audio_queue,
+        &audio_convert1,
+        &audio_resample,
+        &audio_sink,
+        &video_queue,
+        &audio_convert2,
+        &visual,
+        &video_convert,
+        &video_sink,
+        &app_queue,
+        &appsink,
+    ])?;
+    gst::Element::link_many(&[&appsrc, &tee])?;
+    gst::Element::link_many(&[&audio_queue, &audio_convert1, &audio_resample, &audio_sink])?;
+    gst::Element::link_many(&[
+        &video_queue,
+        &audio_convert2,
+        &visual,
+        &video_convert,
+        &video_sink,
+    ])?;
+    gst::Element::link_many(&[&app_queue, &appsink])?;
+
+    fn link_pad(
+        src: &gst::Element,
+        dst: &gst::Element,
+    ) -> Result<gst::PadLinkSuccess, gst::PadLinkError> {
+        let src_pad = src.request_pad_simple("src_%u").unwrap();
+        log::info!("Obtained request pad {} for audio branch", src_pad.name());
+
+        let dst_pad = dst.static_pad("sink").unwrap();
+        src_pad.link(&dst_pad)
+    }
+    link_pad(&tee, &audio_queue)?;
+    link_pad(&tee, &video_queue)?;
+    link_pad(&tee, &app_queue)?;
+
+    // configure appsrc
+
+    let info = AudioInfo::builder(gstreamer_audio::AudioFormat::S16le, SAMPLE_RATE, 1).build()?;
+    let audio_caps = info.to_caps()?;
+
+    let appsrc = appsrc.dynamic_cast::<AppSrc>().unwrap();
+    appsrc.set_caps(Some(&audio_caps));
+    appsrc.set_format(gst::Format::Time);
+
+    let appsink = appsink.dynamic_cast::<AppSink>().unwrap();
+    let data = Arc::new(Mutex::new(CustomData::new(&appsrc, &appsink)));
+    let data_weak = Arc::downgrade(&data);
+    let data_weak2 = Arc::downgrade(&data);
+
+    // appsrcにシグナルコールバックを登録する
+    // need-data, enough-dataでそれぞれデータが空になるか、いっぱいになるかで発火する
+    // need-dataではデータがほぼ空になったらデータを生成してappsinkのバッファーに積む
+    // enough-dataが呼ばれたら登録されたsource_idを使ってfeeding処理を停止する
+    appsrc.set_callbacks(
+        gstreamer_app::AppSrcCallbacks::builder()
+            .need_data(move |_, _| {
+                let data = match data_weak.upgrade() {
+                    Some(data) => data,
+                    None => return,
+                };
+                let mut d = data.lock().unwrap();
+
+                if d.source_id.is_none() {
+                    log::info!("start feeding");
+                    // 2つめのdowngradeを用意してidle_addで別のロックを取った結果を書き込ませる?
+                    // 競合しないの?
+                    let data_weak = Arc::downgrade(&data);
+                    // idle_addはデータをフィードするためのアイドル関数
+                    // 他に優先度の高いタスクがない時にこの処理が呼ばれる
+                    d.source_id = Some(glib::source::idle_add(move || {
+                        let data = match data_weak.upgrade() {
+                            Some(data) => data,
+                            None => return glib::Continue(false),
+                        };
+
+                        let (appsrc, buffer) = {
+                            let mut data = data.lock().unwrap();
+                            let mut buffer = gst::Buffer::with_size(CHUNK_SIZE).unwrap();
+                            let num_samples = CHUNK_SIZE / 2; /* Each sample is 16 bits */
+                            let pts = gst::ClockTime::SECOND
+                                .mul_div_floor(data.num_samples, u64::from(SAMPLE_RATE))
+                                .expect("u64 overflow");
+                            let duration = gst::ClockTime::SECOND
+                                .mul_div_floor(num_samples as u64, u64::from(SAMPLE_RATE))
+                                .expect("u64 overflow");
+
+                            {
+                                let buffer = buffer.get_mut().unwrap();
+                                {
+                                    let mut samples = buffer.map_writable().unwrap();
+                                    let samples = samples.as_mut_slice_of::<i16>().unwrap();
+
+                                    // Generate some psychodelic waveforms
+                                    data.c += data.d;
+                                    data.d -= data.c / 1000.0;
+                                    let freq = 1100.0 + 1000.0 * data.d;
+
+                                    for sample in samples.iter_mut() {
+                                        data.a += data.b;
+                                        data.b -= data.a / freq;
+                                        *sample = 500 * (data.a as i16);
+                                    }
+
+                                    data.num_samples += num_samples as u64;
+                                }
+
+                                buffer.set_pts(pts);
+                                buffer.set_duration(duration);
+                            }
+
+                            (data.appsrc.clone(), buffer)
+                        };
+
+                        glib::Continue(appsrc.push_buffer(buffer).is_ok())
+                    }));
+                }
+            })
+            .enough_data(move |_| {
+                let data = match data_weak2.upgrade() {
+                    Some(data) => data,
+                    None => return,
+                };
+
+                let mut data = data.lock().unwrap();
+                if let Some(source) = data.source_id.take() {
+                    log::info!("stop feeding {source:?}");
+                    source.remove();
+                }
+            })
+            .build(),
+    );
+
+    // configure appsink
+    appsink.set_caps(Some(&audio_caps));
+
+    let data_weak = Arc::downgrade(&data);
+    // appsinkのcallbackでnew_sampleは新しいバッファが来るたびに発行される
+    appsink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |_| {
+                let data = match data_weak.upgrade() {
+                    Some(data) => data,
+                    None => return Ok(gst::FlowSuccess::Ok),
+                };
+
+                let appsink = {
+                    let data = data.lock().unwrap();
+                    data.appsink.clone()
+                };
+
+                if let Ok(_sample) = appsink.pull_sample() {
+                    // Sample: https://docs.rs/gstreamer/latest/gstreamer/sample/struct.Sample.html
+                    // has buffer(data detail), caps(format), segment(timestamp)
+                    // The only thing we do in this example is print a * to indicate a received buffer
+                    print!("*");
+                    let _ = std::io::stdout().flush();
+                }
+
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let main_loop_clone = main_loop.clone();
+    let bus = pipeline.bus().unwrap();
+    #[allow(clippy::single_match)]
+    bus.connect_message(Some("error"), move |_, msg| match msg.view() {
+        gst::MessageView::Error(err) => {
+            let main_loop = &main_loop_clone;
+            log::error!(
+                "Error received from element {:?}: {} {:?}",
+                err.src().map(|s| s.path_string()),
+                err.error(),
+                err.debug(),
+            );
+            main_loop.quit();
+        }
+        _ => unreachable!(),
+    });
+    bus.add_signal_watch();
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .expect("Unable to set the pipeline to the `Playing` state.");
+
+    main_loop.run();
+
+    pipeline
+        .set_state(gst::State::Null)
+        .expect("Unable to set the pipeline to the `Null` state.");
+
+    bus.remove_signal_watch();
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     /// show content of tutorial. B?=Basic
@@ -1009,6 +1296,7 @@ arg_enum! {
         B5,
         B6,
         B7,
+        B8,
     }
 }
 
@@ -1025,5 +1313,6 @@ fn main() {
         Tutorial::B5 => tutorial_guikit().unwrap(),
         Tutorial::B6 => tutorial_media_pad().unwrap(),
         Tutorial::B7 => tutorial_multithread_pad().unwrap(),
+        Tutorial::B8 => tutorial_shortcut_pipeline().unwrap(),
     }
 }
