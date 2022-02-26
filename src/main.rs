@@ -4,7 +4,7 @@ use std::{ffi::c_void, io::Write};
 use anyhow::Context;
 use env_logger::Env;
 use gst::prelude::*;
-use structopt::{clap::arg_enum, StructOpt};
+use structopt::{StructOpt};
 
 fn tutorial_helloworld() -> anyhow::Result<()> {
     gst::init().context("failed to init gstreamer")?;
@@ -1277,29 +1277,198 @@ fn tutorial_shortcut_pipeline() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// URIに関する情報を復元する方法
+/// URIが再生可能課確認する方法
+fn tutorial_media_info(uri: &str) -> anyhow::Result<()> {
+    // GstDiscoverのpbutilsで１つ以上のURIを受け取ってそれらに関する情報を得られる
+    // 同期モードで呼び出す場合はgst_discoverer_discover_uri()
+    // 非同期の場合は以下のチュートリアルで行う。
+    // 復元できるのはCodec, Stream topology, available Metadataが含まれる
+    // gst-discover-1.0が同じことをしている
+
+    use gstreamer_pbutils::{
+        prelude::*, Discoverer, DiscovererContainerInfo, DiscovererInfo, DiscovererResult,
+        DiscovererStreamInfo,
+    };
+
+    fn send_value_as_str(v: &glib::SendValue) -> Option<String> {
+        if let Ok(s) = v.get::<&str>() {
+            Some(s.to_string())
+        } else if let Ok(serialized) = v.serialize() {
+            Some(serialized.into())
+        } else {
+            None
+        }
+    }
+
+    fn print_stream_info(info: &DiscovererStreamInfo, depth: usize) {
+        let caps_str = if let Some(caps) = info.caps() {
+            if caps.is_fixed() {
+                gstreamer_pbutils::pb_utils_get_codec_description(&caps)
+                    .unwrap_or_else(|_| glib::GString::from("unknown codec"))
+            } else {
+                glib::GString::from(caps.to_string())
+            }
+        } else {
+            glib::GString::from("")
+        };
+
+        let stream_nick = info.stream_type_nick();
+        log::info!(
+            "{stream_nick:>indent$}: {caps_str}",
+            stream_nick = stream_nick,
+            indent = 2 * depth + stream_nick.len(),
+            caps_str = caps_str
+        );
+
+        if let Some(tags) = info.tags() {
+            log::info!("{:indent$}Tags:", " ", indent = 2 * depth);
+            for (tag, values) in tags.iter_generic() {
+                let mut tags_str = format!(
+                    "{tag:>indent$}: ",
+                    tag = tag,
+                    indent = 2 * (2 + depth) + tag.len()
+                );
+                let mut tag_num = 0;
+                for value in values {
+                    if let Some(s) = send_value_as_str(value) {
+                        if tag_num > 0 {
+                            tags_str.push_str(", ")
+                        }
+                        tags_str.push_str(&s[..]);
+                        tag_num += 1;
+                    }
+                }
+                log::info!("{tags_str}");
+            }
+        }
+    }
+
+    fn print_topology(info: &DiscovererStreamInfo, depth: usize) {
+        print_stream_info(info, depth);
+
+        if let Some(next) = info.next() {
+            print_topology(&next, depth + 1);
+        } else if let Some(container_info) = info.downcast_ref::<DiscovererContainerInfo>() {
+            for stream in container_info.streams() {
+                print_topology(&stream, depth + 1);
+            }
+        }
+    }
+
+    fn on_discovered(
+        _discoverer: &Discoverer,
+        discoverer_info: &DiscovererInfo,
+        error: Option<&glib::Error>,
+    ) {
+        let uri = discoverer_info.uri().unwrap();
+        match discoverer_info.result() {
+            DiscovererResult::Ok => log::info!("Discovered {uri}"),
+            DiscovererResult::UriInvalid => log::info!("Invalid uri {uri}"),
+            DiscovererResult::Error => {
+                if let Some(msg) = error {
+                    log::info!("{msg}");
+                } else {
+                    log::info!("Unknown error")
+                }
+            }
+            DiscovererResult::Timeout => log::info!("Timeout"),
+            DiscovererResult::Busy => log::info!("Busy"),
+            DiscovererResult::MissingPlugins => {
+                if let Some(s) = discoverer_info.misc() {
+                    log::info!("{}", s);
+                }
+            }
+            _ => log::info!("Unknown result"),
+        }
+
+        if discoverer_info.result() != DiscovererResult::Ok {
+            return;
+        }
+
+        log::info!("Duration: {}", discoverer_info.duration().display());
+
+        if let Some(tags) = discoverer_info.tags() {
+            log::info!("Tags:");
+            for (tag, values) in tags.iter_generic() {
+                values.for_each(|v| {
+                    if let Some(s) = send_value_as_str(v) {
+                        log::info!("  {tag}: {s}")
+                    }
+                })
+            }
+        }
+
+        log::info!(
+            "Seekable: {}",
+            if discoverer_info.is_seekable() {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+
+        log::info!("Stream information:");
+
+        if let Some(stream_info) = discoverer_info.stream_info() {
+            print_topology(&stream_info, 1);
+        }
+    }
+
+    log::info!("Discovering {uri}");
+
+    gst::init()?;
+
+    let loop_ = glib::MainLoop::new(None, false);
+    let timeout = 5 * gst::ClockTime::SECOND;
+    let discoverer = gstreamer_pbutils::Discoverer::new(timeout)?;
+    discoverer.connect_discovered(on_discovered);
+    let loop_clone = loop_.clone();
+    discoverer.connect_finished(move |_| {
+        log::info!("Finished discovering");
+        loop_clone.quit();
+    });
+    discoverer.start();
+    discoverer.discover_uri_async(uri)?;
+    loop_.run();
+
+    discoverer.stop();
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
-    /// show content of tutorial. B?=Basic
-    #[structopt(possible_values = &Tutorial::variants(), case_insensitive = true)]
+    #[structopt(subcommand)]
     tid: Tutorial,
 }
 
-arg_enum! {
-    #[derive(Debug)]
-    enum Tutorial {
-        // Basic tutorial 1 HelloWorld
-        B1,
-        // Basic tutorial 2 Gstreamer concept
-        B2,
-        B3,
-        B4,
-        B5,
-        B6,
-        B7,
-        B8,
-    }
+#[derive(Debug, StructOpt)]
+enum Tutorial {
+    /// Basic tutorial 1 HelloWorld
+    B1,
+    /// Basic tutorial 2 Gstreamer concept
+    B2,
+    /// Basic tutorial 3 Dynamic pipeline
+    B3,
+    /// Basic tutorial 4 time managgement
+    B4,
+    /// Basic tutorial 5 GUI toolkit
+    B5,
+    /// Basic tutorial 6 Media format and pads
+    B6,
+    /// Basic tutorial 7 Multithread
+    B7,
+    /// Basic tutorial 2 shuort-cutting the pipeline
+    B8,
+    /// Basic tutorial 2 Discover
+    B9 {
+        #[structopt(
+            default_value = "https://www.freedesktop.org/software/gstreamer-sdk/data/media/sintel_trailer-480p.webm"
+        )]
+        uri: String,
+    },
 }
-
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
 
@@ -1314,5 +1483,6 @@ fn main() {
         Tutorial::B6 => tutorial_media_pad().unwrap(),
         Tutorial::B7 => tutorial_multithread_pad().unwrap(),
         Tutorial::B8 => tutorial_shortcut_pipeline().unwrap(),
+        Tutorial::B9 { uri } => tutorial_media_info(&uri).unwrap(),
     }
 }
