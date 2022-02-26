@@ -4,7 +4,7 @@ use std::{ffi::c_void, io::Write};
 use anyhow::Context;
 use env_logger::Env;
 use gst::prelude::*;
-use structopt::{StructOpt};
+use structopt::StructOpt;
 
 fn tutorial_helloworld() -> anyhow::Result<()> {
     gst::init().context("failed to init gstreamer")?;
@@ -1437,6 +1437,79 @@ fn tutorial_media_info(uri: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// bufferingを有効にする方法(ネットワークの問題の軽減)
+/// 中断から回復する方法
+fn tutorial_streaming() -> anyhow::Result<()> {
+    gst::init()?;
+
+    let uri =
+        "https://www.freedesktop.org/software/gstreamer-sdk/data/media/sintel_trailer-480p.webm";
+    let pipeline = gst::parse_launch(&format!("playbin uri={}", uri))?;
+
+    // Start playing
+    let res = pipeline.set_state(gst::State::Playing)?;
+    let is_live = res == gst::StateChangeSuccess::NoPreroll;
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let main_loop_clone = main_loop.clone();
+    let pipeline_weak = pipeline.downgrade();
+    let bus = pipeline.bus().expect("Pipeline has no bus");
+    bus.add_watch(move |_, msg| {
+        use gst::MessageView::*;
+        let pipeline = match pipeline_weak.upgrade() {
+            Some(pipeline) => pipeline,
+            None => return glib::Continue(true),
+        };
+        let main_loop = &main_loop_clone;
+
+        match msg.view() {
+            Error(err) => {
+                log::error!(
+                    "Error received from element {:?}: {} {:?}",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug(),
+                );
+                main_loop.quit();
+            }
+            Eos(_) => {
+                // end-of-stream
+                let _ = pipeline.set_state(gst::State::Ready);
+                main_loop.quit();
+            }
+            // bufferが所定量貯まるまで再生しない
+            Buffering(buffering) => {
+                if is_live {
+                    return glib::Continue(true);
+                }
+                let percent = buffering.percent();
+                log::info!("Buffering ({percent})");
+                std::io::stdout().flush().unwrap();
+
+                if percent < 30 {
+                    let _ = pipeline.set_state(gst::State::Paused);
+                } else {
+                    let _ = pipeline.set_state(gst::State::Playing);
+                }
+            }
+            ClockLost(_) => {
+                // Get a new clock
+                let _ = pipeline.set_state(gst::State::Paused);
+                let _ = pipeline.set_state(gst::State::Playing);
+            }
+            _ => {}
+        }
+        glib::Continue(true)
+    })?;
+
+    main_loop.run();
+
+    bus.remove_watch()?;
+    pipeline.set_state(gst::State::Null)?;
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(subcommand)]
@@ -1459,15 +1532,17 @@ enum Tutorial {
     B6,
     /// Basic tutorial 7 Multithread
     B7,
-    /// Basic tutorial 2 shuort-cutting the pipeline
+    /// Basic tutorial 8 shuort-cutting the pipeline
     B8,
-    /// Basic tutorial 2 Discover
+    /// Basic tutorial 9 Discover
     B9 {
         #[structopt(
             default_value = "https://www.freedesktop.org/software/gstreamer-sdk/data/media/sintel_trailer-480p.webm"
         )]
         uri: String,
     },
+    // Basic tutorial 12 Buffering
+    B12,
 }
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
@@ -1484,5 +1559,6 @@ fn main() {
         Tutorial::B7 => tutorial_multithread_pad().unwrap(),
         Tutorial::B8 => tutorial_shortcut_pipeline().unwrap(),
         Tutorial::B9 { uri } => tutorial_media_info(&uri).unwrap(),
+        Tutorial::B12 => tutorial_streaming().unwrap(),
     }
 }
