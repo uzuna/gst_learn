@@ -3,7 +3,8 @@ use std::{ffi::c_void, io::Write};
 
 use anyhow::Context;
 use env_logger::Env;
-use gst::prelude::*;
+use gst::{prelude::*, ResourceError};
+use gstreamer_app::AppSink;
 use structopt::StructOpt;
 
 fn tutorial_helloworld() -> anyhow::Result<()> {
@@ -1710,6 +1711,96 @@ USAGE: Choose one of the following options, then press enter:
     Ok(())
 }
 
+/// videotestsrcのプレビューとメタデータの表示を行う
+fn preview_metadata() -> anyhow::Result<()> {
+    gst::init()?;
+
+    let source = gst::ElementFactory::make("videotestsrc", Some("source"))
+        .context("Colud not create source element")?;
+    let tee = gst::ElementFactory::make("tee", Some("tee"))?;
+    let prev_queue = gst::ElementFactory::make("queue", Some("prev_queue"))?;
+    let app_queue = gst::ElementFactory::make("queue", Some("app_queue"))?;
+    let prev_sink = gst::ElementFactory::make("autovideosink", Some("sink"))?;
+    let app_sink = gst::ElementFactory::make("appsink", Some("appsink"))?;
+
+    let pipeline = gst::Pipeline::new(Some("test-pipeline"));
+
+    pipeline.add_many(&[
+        &source,
+        &tee,
+        &prev_queue,
+        &prev_sink,
+        &app_queue,
+        &app_sink,
+    ])?;
+
+    fn link_pad(
+        src: &gst::Element,
+        dst: &gst::Element,
+    ) -> Result<gst::PadLinkSuccess, gst::PadLinkError> {
+        let src_pad = src.request_pad_simple("src_%u").unwrap();
+        log::info!("Obtained request pad {} for audio branch", src_pad.name());
+
+        let dst_pad = dst.static_pad("sink").unwrap();
+        src_pad.link(&dst_pad)
+    }
+    gst::Element::link_many(&[&source, &tee])?;
+    gst::Element::link_many(&[&prev_queue, &prev_sink])?;
+    gst::Element::link_many(&[&app_queue, &app_sink])?;
+    link_pad(&tee, &prev_queue)?;
+    link_pad(&tee, &app_queue)?;
+
+    let app_sink = app_sink.dynamic_cast::<AppSink>().unwrap();
+    app_sink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |app_sink| {
+                if let Ok(sample) = app_sink.pull_sample() {
+                    log::info!(
+                        "Buffer: {:?}, Caps: {:?}, Segment: {:?}",
+                        sample.buffer().unwrap(),
+                        sample.caps().unwrap(),
+                        sample.segment().unwrap()
+                    );
+                }
+
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+
+    source.set_property_from_str("pattern", "smpte");
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .context("Unable to set the pipeline to the `Playing` state")?;
+
+    let bus = pipeline.bus().context("fauled to get bus")?;
+    for msg in bus.iter_timed(gst::ClockTime::NONE) {
+        use gst::MessageView;
+
+        match msg.view() {
+            MessageView::Eos(_) => break,
+            MessageView::Error(err) => {
+                // window close -> "Output window was closed"
+                log::error!(
+                    "Error from {:?}: {} ({:?})",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug()
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    pipeline
+        .set_state(gst::State::Null)
+        .expect("Unable to set the pipeline to the `Null` state");
+
+    Ok(())
+}
+
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(subcommand)]
@@ -1745,6 +1836,9 @@ enum Tutorial {
     B12,
     // Basic tutorial 13 PlaybackSpeed
     B13,
+
+    // test metadata view
+    T1,
 }
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
@@ -1763,5 +1857,6 @@ fn main() {
         Tutorial::B9 { uri } => tutorial_media_info(&uri).unwrap(),
         Tutorial::B12 => tutorial_streaming().unwrap(),
         Tutorial::B13 => tutorial_playback_speed().unwrap(),
+        Tutorial::T1 => preview_metadata().unwrap(),
     }
 }
