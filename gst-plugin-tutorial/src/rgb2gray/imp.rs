@@ -9,6 +9,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use gst::glib;
+use gst::gst_debug;
+
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
@@ -90,6 +92,20 @@ impl ObjectSubclass for Rgb2Gray {
     const NAME: &'static str = "RsRgb2Gray";
     type Type = super::Rgb2Gray;
     type ParentType = gst_video::VideoFilter;
+
+    // fn class_init(klass: &mut Self::Class) {
+    //     klass.set_metadata(
+    //         "RGB-GRAY Converter",
+    //         "Filter/Effect/Converter/Video",
+    //         "Converts RGB to GRAY or grayscale RGB",
+    //         "Sebastian Dröge <sebastian@centricular.com>",
+    //     );
+    //     klass.configure(
+    //         gst_base::subclass::BaseTransformMode::NeverInPlace,
+    //         false,
+    //         false,
+    //     );
+    // }
 }
 
 // Implementation of glib::Object virtual methods
@@ -361,6 +377,16 @@ impl VideoFilterImpl for Rgb2Gray {
         let out_stride = out_frame.plane_stride()[0] as usize;
         let out_format = out_frame.format();
         let out_data = out_frame.plane_data_mut(0).unwrap();
+
+        gst_debug!(
+            CAT,
+            obj: _element,
+            "pts: {:?}, duration: {:?}, size: {}, offset: {}",
+            in_frame.buffer().pts(),
+            in_frame.buffer().duration(),
+            in_frame.buffer().size(),
+            in_frame.buffer().offset(),
+        );
 
         // First check the output format. Our input format is always BGRx but the output might
         // be BGRx or GRAY8. Based on what it is we need to do processing slightly differently.
