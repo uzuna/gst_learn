@@ -3,6 +3,7 @@ use std::{ffi::c_void, io::Write};
 
 use anyhow::Context;
 use env_logger::Env;
+use glib::translate::IntoGlib;
 use gst::{prelude::*, ResourceError};
 use gstreamer_app::AppSink;
 use structopt::StructOpt;
@@ -1717,6 +1718,7 @@ fn preview_metadata() -> anyhow::Result<()> {
 
     let source = gst::ElementFactory::make("videotestsrc", Some("source"))
         .context("Colud not create source element")?;
+    let timeoverlay = gst::ElementFactory::make("timeoverlay", Some("timeoverlay"))?;
     let tee = gst::ElementFactory::make("tee", Some("tee"))?;
     let prev_queue = gst::ElementFactory::make("queue", Some("prev_queue"))?;
     let app_queue = gst::ElementFactory::make("queue", Some("app_queue"))?;
@@ -1727,6 +1729,7 @@ fn preview_metadata() -> anyhow::Result<()> {
 
     pipeline.add_many(&[
         &source,
+        &timeoverlay,
         &tee,
         &prev_queue,
         &prev_sink,
@@ -1744,7 +1747,7 @@ fn preview_metadata() -> anyhow::Result<()> {
         let dst_pad = dst.static_pad("sink").unwrap();
         src_pad.link(&dst_pad)
     }
-    gst::Element::link_many(&[&source, &tee])?;
+    gst::Element::link_many(&[&source, &timeoverlay, &tee])?;
     gst::Element::link_many(&[&prev_queue, &prev_sink])?;
     gst::Element::link_many(&[&app_queue, &app_sink])?;
     link_pad(&tee, &prev_queue)?;
@@ -1756,10 +1759,11 @@ fn preview_metadata() -> anyhow::Result<()> {
             .new_sample(move |app_sink| {
                 if let Ok(sample) = app_sink.pull_sample() {
                     log::info!(
-                        "Buffer: {:?}, Caps: {:?}, Segment: {:?}",
+                        "Buffer: {:?}, Caps: {:?}, Segment: {:?} BT:{:?}",
                         sample.buffer().unwrap(),
                         sample.caps().unwrap(),
-                        sample.segment().unwrap()
+                        sample.segment().unwrap(),
+                        app_sink.base_time().unwrap()
                     );
                 }
 
@@ -1769,6 +1773,11 @@ fn preview_metadata() -> anyhow::Result<()> {
     );
 
     source.set_property_from_str("pattern", "smpte");
+    // 意味はわからないけど設定出来る
+    // source.set_property("blocksize", 10_u32);
+    // live sourceならばtimestamp付与が出来るが、どこにどのように付与されているのかはわからなかった
+    source.set_property("is-live", true);
+    source.set_property("do-timestamp", true);
 
     pipeline
         .set_state(gst::State::Playing)
