@@ -10,7 +10,7 @@
 
 use gst::glib;
 use gst::gst_debug;
-
+use gst::gst_info;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::subclass::prelude::*;
@@ -388,6 +388,11 @@ impl VideoFilterImpl for Rgb2Gray {
             in_frame.buffer().offset(),
         );
 
+        // データを出力しない場合はCustomSuccess == GST_BASE_TRANSFORM_FLOW_DROPPEDを返す
+        if in_frame.buffer().offset() % 2 == 0 {
+            return Ok(gst::FlowSuccess::CustomSuccess);
+        }
+
         // First check the output format. Our input format is always BGRx but the output might
         // be BGRx or GRAY8. Based on what it is we need to do processing slightly differently.
         if out_format == gst_video::VideoFormat::Bgrx {
@@ -475,7 +480,6 @@ impl VideoFilterImpl for Rgb2Gray {
         } else {
             unimplemented!();
         }
-
         Ok(gst::FlowSuccess::Ok)
     }
 }
